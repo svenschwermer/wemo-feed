@@ -1,7 +1,7 @@
 TARGET := wemo-insight
-SRC := ring_buffer.c insight.c
+SRC := main.c insight.c ring_buffer.c
 OBJ := $(SRC:%.c=%.o)
-LIBS :=
+LIBS := -lubox -lubus
 
 $(TARGET): $(OBJ)
 	$(CC) $(LDFLAGS) -o $@ $^ $(LIBS)

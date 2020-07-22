@@ -9,12 +9,12 @@
 #include <unistd.h>
 #include <linux/serial.h>
 #include <sys/ioctl.h>
-#include "ring_buffer.h"
 
-static const char *SERIAL_DEVICE = "/dev/ttyS1";
-static const speed_t BAUDRATE = B9600;
-static const uint8_t START_BYTE = 0xAE;
-static const uint8_t MESSAGE_LENGTH = 30;
+#include <libubox/ulog.h>
+#include <libubox/ustream.h>
+
+#include "insight.h"
+#include "ring_buffer.h"
 
 enum fsm_state
 {
@@ -22,6 +22,14 @@ enum fsm_state
     READ_LENGTH,
     READ_MESSAGE,
     VERIFY_CHECKSUM,
+};
+
+struct insight_data
+{
+    struct ustream_fd s;
+    struct ring_buffer *rb;
+    enum fsm_state state;
+    uint8_t length, i, checksum;
 };
 
 struct report
@@ -37,91 +45,191 @@ struct report
     float active_energy;
 };
 
-static void fsm(int fd);
+static void read_cb(struct ustream *s, int bytes_new);
+static void state_cb(struct ustream *s);
 static void consume_message(struct ring_buffer *rb);
 static void print_report(const struct report *report);
 static float get_word(struct ring_buffer *rb, float factor);
 static int open_serial_port(void);
 
-int main()
+static const speed_t BAUDRATE = B9600;
+static const uint8_t START_BYTE = 0xAE;
+static const uint8_t MESSAGE_LENGTH = 30;
+
+struct insight_data *insight_open(const char *dev)
 {
-    int fd = open_serial_port();
-    assert(fd > 0);
-    fsm(fd);
+    struct insight_data *data = malloc(sizeof(struct insight_data));
+    if (data == NULL)
+    {
+        ULOG_ERR("Failed to allocate insight data: %s\n", strerror(errno));
+        goto err_exit;
+    }
+    data->rb = rb_new();
+    if (data->rb == NULL)
+    {
+        ULOG_ERR("Failed to allocate ring buffer: %s\n", strerror(errno));
+        goto free_data;
+    }
+    data->state = FIND_START;
+
+    int fd = open(dev, O_RDONLY | O_NOCTTY);
+    if (fd < 0)
+    {
+        ULOG_ERR("Failed to open serial port %s: %s\n", dev, strerror(errno));
+        goto free_data;
+    }
+
+    struct termios tio;
+    if (tcgetattr(fd, &tio) < 0)
+    {
+        ULOG_ERR("Failed to get terminal attributes: %s\n", strerror(errno));
+        goto close_fd;
+    }
+
+    tio.c_oflag &= ~OPOST;
+    tio.c_lflag &= ~(ICANON | ECHO | ECHOE | ISIG); // raw mode
+    tio.c_iflag &= ~(IXON | IXOFF | IXANY);         // disable software flow control
+    tio.c_iflag |= IGNBRK;                          // ignore break
+    tio.c_iflag &= ~ISTRIP;                         // do not strip high bit
+    tio.c_iflag &= ~(INLCR | ICRNL);                // do not modify CR/NL
+    tio.c_cflag |= (CLOCAL | CREAD);                // enable the receiver and set local mode
+    tio.c_cflag &= ~CRTSCTS;                        // disable hardware flow control
+    tio.c_cflag &= ~CSIZE;                          // Mask the character size bits
+    tio.c_cflag |= CS8;                             // 8 data bits
+    tio.c_cflag &= ~PARENB;                         // no parity
+    tio.c_cflag &= ~CSTOPB;                         // 1 stop bit
+
+    if (cfsetspeed(&tio, BAUDRATE) < 0)
+    {
+        ULOG_ERR("Setting baudrate failed: %s\n", strerror(errno));
+        goto close_fd;
+    }
+
+    if (tcsetattr(fd, TCSANOW, &tio) < 0)
+    {
+        ULOG_ERR("Failed to set terminal attributes: %s\n", strerror(errno));
+        goto close_fd;
+    }
+
+    struct serial_struct ser;
+    if (ioctl(fd, TIOCGSERIAL, &ser) != 0)
+    {
+        ULOG_ERR("Failed to get serial line configuration: %s\n", strerror(errno));
+        goto close_fd;
+    }
+
+    ser.flags &= ~ASYNC_SPD_MASK;
+    ser.flags |= ASYNC_SPD_CUST;
+    ser.custom_divisor = ser.baud_base / 38400;
+
+    if (ioctl(fd, TIOCSSERIAL, &ser) != 0)
+    {
+        ULOG_ERR("Failed to set serial line configuration: %s\n", strerror(errno));
+        goto close_fd;
+    }
+
+    data->s.stream.string_data = true;
+    data->s.stream.notify_read = read_cb;
+    data->s.stream.notify_state = state_cb;
+    ustream_fd_init(&data->s, fd);
+
+    tcflush(fd, TCIFLUSH);
+
+    return data;
+
+close_fd:
     close(fd);
+free_data:
+    if (data->rb != NULL)
+        rb_free(data->rb);
+    free(data);
+err_exit:
+    return NULL;
+}
+
+int insight_free(struct insight_data *h)
+{
+    close(h->s.fd.fd);
+    ustream_free(&h->s.stream);
+    rb_free(h->rb);
+    free(h);
     return 0;
 }
 
-static void fsm(int fd)
+static void read_cb(struct ustream *s, int bytes_new)
 {
-    int c;
-    uint8_t length, i, checksum;
-    enum fsm_state state = FIND_START;
-    struct ring_buffer *rb = rb_new();
-    assert(rb != NULL);
+    struct ustream_fd *s_fd = container_of(s, struct ustream_fd, stream);
+    struct insight_data *data = container_of(s_fd, struct insight_data, s);
 
-    while (1)
+    while (bytes_new-- > 0)
     {
-        c = rb_getc(rb, fd);
+        int c = rb_getc(data->rb, s);
         if (c < 0)
         {
-            fprintf(stderr, "Failed to read byte: %s\n", strerror(-c));
+            ULOG_ERR("Failed to read byte: %s\n", strerror(-c));
             break;
         }
-        checksum += c;
+        data->checksum += c;
 
-        switch (state)
+        switch (data->state)
         {
         case FIND_START:
             if (c == START_BYTE)
             {
-                checksum = c;
-                state = READ_LENGTH;
+                data->checksum = c;
+                data->state = READ_LENGTH;
             }
             else
             {
-                fprintf(stderr, "Discarding non-start byte (0x%02x)\n", c);
-                rb_pop(rb);
+                ULOG_WARN("Discarding non-start byte (0x%02x)\n", c);
+                rb_pop(data->rb);
             }
             break;
 
         case READ_LENGTH:
-            length = c;
-            if (length == MESSAGE_LENGTH)
+            data->length = c;
+            if (data->length == MESSAGE_LENGTH)
             {
-                i = 2;
-                state = READ_MESSAGE;
+                data->i = 2;
+                data->state = READ_MESSAGE;
             }
             else
             {
-                fprintf(stderr, "Unexpected length (%d)\n", length);
-                rb_pop(rb);
-                rb_reset_iterator(rb);
-                state = FIND_START;
+                ULOG_ERR("Unexpected length (%d)\n", data->length);
+                rb_pop(data->rb);
+                rb_reset_iterator(data->rb);
+                data->state = FIND_START;
             }
             break;
 
         case READ_MESSAGE:
-            if (++i >= length - 1)
-                state = VERIFY_CHECKSUM;
+            if (++data->i >= data->length - 1)
+                data->state = VERIFY_CHECKSUM;
             break;
 
         case VERIFY_CHECKSUM:
-            if (checksum == 0)
-                consume_message(rb);
+            if (data->checksum == 0)
+                consume_message(data->rb);
             else
             {
-                fprintf(stderr, "Wrong checksum (0x%02x)\n", checksum);
-                rb_pop(rb);
+                ULOG_ERR("Wrong checksum (0x%02x)\n", data->checksum);
+                rb_pop(data->rb);
             }
-            rb_reset_iterator(rb);
-            state = FIND_START;
+            rb_reset_iterator(data->rb);
+            data->state = FIND_START;
             break;
         }
     }
+}
 
-    rb_free(rb);
-    fputs("FSM terminating\n", stderr);
+static void state_cb(struct ustream *s)
+{
+    if (s->eof)
+    {
+        ULOG_ERR("tty error, shutting down\n");
+        // TODO: is there a better way to handle this?
+        exit(-1);
+    }
 }
 
 static void consume_message(struct ring_buffer *rb)
@@ -178,69 +286,4 @@ static float get_word(struct ring_buffer *rb, float factor)
     if (word & 0x00800000)
         word |= 0xff000000;
     return word * factor;
-}
-
-static int open_serial_port(void)
-{
-    int fd = open(SERIAL_DEVICE, O_RDONLY | O_NOCTTY);
-    if (fd < 0)
-    {
-        fprintf(stderr, "Failed to open serial port %s: %s\n", SERIAL_DEVICE, strerror(errno));
-        return -1;
-    }
-
-    struct termios termios;
-    if (tcgetattr(fd, &termios) < 0)
-    {
-        fprintf(stderr, "Failed to get terminal attributes: %s\n", strerror(errno));
-        goto error;
-    }
-
-    termios.c_oflag &= ~OPOST;
-    termios.c_lflag &= ~(ICANON | ECHO | ECHOE | ISIG); // raw mode
-    termios.c_iflag &= ~(IXON | IXOFF | IXANY);         // disable software flow control
-    termios.c_iflag |= IGNBRK;                          // ignore break
-    termios.c_iflag &= ~ISTRIP;                         // do not strip high bit
-    termios.c_iflag &= ~(INLCR | ICRNL);                // do not modify CR/NL
-    termios.c_cflag |= (CLOCAL | CREAD);                // enable the receiver and set local mode
-    termios.c_cflag &= ~CRTSCTS;                        // disable hardware flow control
-    termios.c_cflag &= ~CSIZE;                          // Mask the character size bits
-    termios.c_cflag |= CS8;                             // 8 data bits
-    termios.c_cflag &= ~PARENB;                         // no parity
-    termios.c_cflag &= ~CSTOPB;                         // 1 stop bit
-
-    if (cfsetspeed(&termios, BAUDRATE) < 0)
-    {
-        fprintf(stderr, "Setting baudrate failed: %s\n", strerror(errno));
-        goto error;
-    }
-
-    if (tcsetattr(fd, TCSANOW, &termios) < 0)
-    {
-        fprintf(stderr, "Failed to set terminal attributes: %s\n", strerror(errno));
-        goto error;
-    }
-
-    struct serial_struct ser;
-    if (ioctl(fd, TIOCGSERIAL, &ser) != 0)
-    {
-        fprintf(stderr, "Failed to get serial line configuration: %s\n", strerror(errno));
-        goto error;
-    }
-
-    ser.flags &= ~ASYNC_SPD_MASK;
-    ser.flags |= ASYNC_SPD_CUST;
-    ser.custom_divisor = ser.baud_base / 38400;
-
-    if (ioctl(fd, TIOCSSERIAL, &ser) != 0)
-    {
-        fprintf(stderr, "Failed to set serial line configuration: %s\n", strerror(errno));
-        goto error;
-    }
-
-    return fd;
-
-error:
-    close(fd);
-    return -1;
 }

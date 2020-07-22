@@ -54,16 +54,16 @@ int rb_pop(struct ring_buffer *rb)
 }
 
 // Gets a byte from the ring buffer without consuming it, i.e. advancing the
-// read index. If no byte is available, new data will be read from fd. If that
+// read index. If no byte is available, new data will be read from s. If that
 // read fails or the ring buffer is full, -1 will be returned. Otherwise, 0 is
 // returned.
-int rb_getc(struct ring_buffer *rb, int fd)
+int rb_getc(struct ring_buffer *rb, struct ustream *s)
 {
     uint8_t c;
     if (rb->it == rb->write)
     {
         // TODO: Read as many bytes as there is space in the buffer
-        ssize_t result = read(fd, &c, 1);
+        int result = ustream_read(s, &c, 1);
         if (result < 0)
             return -errno;
         if (result == 0)
