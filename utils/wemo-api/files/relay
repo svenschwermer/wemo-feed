@@ -1,0 +1,43 @@
+#!/bin/sh
+
+relay_file="/sys/class/leds/f7c029:device:relay/brightness"
+
+bad_request() {
+	echo "Status: 400 Bad Request"
+	echo
+	exit 1
+}
+
+set_state() {
+	echo "$1" > "$relay_file"
+	echo "$1" > "/sys/class/leds/f7c029:green:power/brightness"
+}
+
+case "$REQUEST_METHOD" in
+GET)
+	echo
+	sed -e s/0/off/ -e s/1/on/ "$relay_file"
+	;;
+
+POST)
+	cmd="$(cat)"
+	case "$cmd" in
+	on)
+		set_state 1
+		;;
+	off)
+		set_state 0
+		;;
+	*)
+		bad_request
+		;;
+	esac
+
+	echo
+	echo "$cmd"
+	;;
+
+*)
+	bad_request
+	;;
+esac
