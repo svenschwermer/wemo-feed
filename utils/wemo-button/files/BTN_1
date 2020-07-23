@@ -1,0 +1,21 @@
+#!/bin/sh
+
+relay_file="/sys/class/leds/f7c029:device:relay/brightness"
+
+set_state() {
+	echo "$1" > "$relay_file"
+	echo "$1" > "/sys/class/leds/f7c029:green:power/brightness"
+}
+
+if [ "$ACTION" != "pressed" ]; then
+	exit
+fi
+
+case "$(cat "$relay_file")" in
+0)
+	set_state 1
+	;;
+1)
+	set_state 0
+	;;
+esac
