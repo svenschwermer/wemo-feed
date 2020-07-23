@@ -1,6 +1,6 @@
-#include <string.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 #include <libubox/ulog.h>
 #include <libubox/uloop.h>
@@ -8,13 +8,46 @@
 
 #include "insight.h"
 
+#define xstr(a) str(a)
+#define str(a) #a
+
+#define add_field(b, d, field) \
+    blobmsg_add_double(&b, xstr(field), d->field)
+
+struct priv
+{
+    struct insight_state *insight;
+    struct ubus_auto_conn ubus_conn;
+};
+
+static struct priv *get_priv(struct ubus_context *ctx)
+{
+    struct ubus_auto_conn *ubus_conn = container_of(ctx, struct ubus_auto_conn, ctx);
+    return container_of(ubus_conn, struct priv, ubus_conn);
+}
+
 static int insight_info(struct ubus_context *ctx, struct ubus_object *obj,
                         struct ubus_request_data *req, const char *method,
                         struct blob_attr *msg)
 {
     struct blob_buf b = {0};
     blob_buf_init(&b, 0);
-    blobmsg_add_u32(&b, "test", 0xdeadbeef);
+
+    struct priv *priv = get_priv(ctx);
+    const struct insight_data *d = insight_borrow_data(priv->insight);
+    
+    add_field(b, d, int_temperature);
+    add_field(b, d, ext_temperature);
+    add_field(b, d, rms_voltage);
+    add_field(b, d, rms_current);
+    add_field(b, d, active_power);
+    add_field(b, d, average_power);
+    add_field(b, d, power_factor);
+    add_field(b, d, line_frequency);
+    add_field(b, d, active_energy);
+    
+    insight_return_data(priv->insight);
+    
     ubus_send_reply(ctx, req, b.head);
     return UBUS_STATUS_OK;
 }
@@ -85,22 +118,23 @@ int main(int argc, char **argv)
     const char *device = argv[optind];
 
     ulog_open(ulog_channels, LOG_DAEMON, "wemo-insight");
-
     uloop_init();
-    struct ubus_auto_conn conn = {
-        .path = ubus_socket,
-        .cb = ubus_connect_handler,
-    };
-    ubus_auto_connect(&conn);
 
-    struct insight_data *h = insight_open(device);
-    if (h == NULL)
+    struct priv priv = {
+        .insight = insight_open(device),
+        .ubus_conn = {
+            .path = ubus_socket,
+            .cb = ubus_connect_handler,
+        },
+    };
+    if (priv.insight == NULL)
         return -1;
 
+    ubus_auto_connect(&priv.ubus_conn);
     uloop_run();
     uloop_done();
 
-    insight_free(h);
+    insight_free(priv.insight);
 
     ULOG_INFO("Shutting down\n");
     return 0;

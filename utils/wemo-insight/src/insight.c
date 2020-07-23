@@ -1,15 +1,15 @@
 #include <assert.h>
 #include <errno.h>
-#include <fcntl.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <fcntl.h>
+#include <pthread.h>
+#include <sys/ioctl.h>
 #include <termios.h>
 #include <unistd.h>
 #include <linux/serial.h>
-#include <sys/ioctl.h>
-
 #include <libubox/ulog.h>
 #include <libubox/ustream.h>
 
@@ -24,59 +24,54 @@ enum fsm_state
     VERIFY_CHECKSUM,
 };
 
-struct insight_data
+struct insight_state
 {
-    struct ustream_fd s;
+    struct ustream_fd s_fd;
     struct ring_buffer *rb;
     enum fsm_state state;
     uint8_t length, i, checksum;
-};
-
-struct report
-{
-    float int_temperature;
-    float ext_temperature;
-    float rms_voltage;
-    float rms_current;
-    float active_power;
-    float average_power;
-    float power_factor;
-    float line_frequency;
-    float active_energy;
+    pthread_rwlock_t data_lock;
+    struct insight_data data;
 };
 
 static void read_cb(struct ustream *s, int bytes_new);
 static void state_cb(struct ustream *s);
-static void consume_message(struct ring_buffer *rb);
-static void print_report(const struct report *report);
+static void consume_message(struct insight_state *s);
 static float get_word(struct ring_buffer *rb, float factor);
-static int open_serial_port(void);
 
 static const speed_t BAUDRATE = B9600;
 static const uint8_t START_BYTE = 0xAE;
 static const uint8_t MESSAGE_LENGTH = 30;
 
-struct insight_data *insight_open(const char *dev)
+struct insight_state *insight_open(const char *dev)
 {
-    struct insight_data *data = malloc(sizeof(struct insight_data));
-    if (data == NULL)
+    struct insight_state *s = malloc(sizeof(struct insight_state));
+    if (s == NULL)
     {
-        ULOG_ERR("Failed to allocate insight data: %s\n", strerror(errno));
+        ULOG_ERR("Failed to allocate insight state: %s\n", strerror(errno));
         goto err_exit;
     }
-    data->rb = rb_new();
-    if (data->rb == NULL)
+    memset(s, 0, sizeof(*s));
+    s->rb = rb_new();
+    if (s->rb == NULL)
     {
         ULOG_ERR("Failed to allocate ring buffer: %s\n", strerror(errno));
         goto free_data;
     }
-    data->state = FIND_START;
+    s->state = FIND_START;
+
+    int ret = pthread_rwlock_init(&s->data_lock, NULL);
+    if (ret)
+    {
+        ULOG_ERR("Failed to init data lock: %s\n", strerror(ret));
+        goto free_data;
+    }
 
     int fd = open(dev, O_RDONLY | O_NOCTTY);
     if (fd < 0)
     {
         ULOG_ERR("Failed to open serial port %s: %s\n", dev, strerror(errno));
-        goto free_data;
+        goto destroy_lock;
     }
 
     struct termios tio;
@@ -128,95 +123,111 @@ struct insight_data *insight_open(const char *dev)
         goto close_fd;
     }
 
-    data->s.stream.string_data = true;
-    data->s.stream.notify_read = read_cb;
-    data->s.stream.notify_state = state_cb;
-    ustream_fd_init(&data->s, fd);
+    s->s_fd.stream.string_data = true;
+    s->s_fd.stream.notify_read = read_cb;
+    s->s_fd.stream.notify_state = state_cb;
+    ustream_fd_init(&s->s_fd, fd);
 
     tcflush(fd, TCIFLUSH);
 
-    return data;
+    return s;
 
 close_fd:
     close(fd);
+destroy_lock:
+    pthread_rwlock_destroy(&s->data_lock);
 free_data:
-    if (data->rb != NULL)
-        rb_free(data->rb);
-    free(data);
+    if (s->rb != NULL)
+        rb_free(s->rb);
+    free(s);
 err_exit:
     return NULL;
 }
 
-int insight_free(struct insight_data *h)
+int insight_free(struct insight_state *s)
 {
-    close(h->s.fd.fd);
-    ustream_free(&h->s.stream);
-    rb_free(h->rb);
-    free(h);
+    close(s->s_fd.fd.fd);
+    pthread_rwlock_destroy(&s->data_lock);
+    ustream_free(&s->s_fd.stream);
+    rb_free(s->rb);
+    free(s);
     return 0;
 }
 
-static void read_cb(struct ustream *s, int bytes_new)
+const struct insight_data *insight_borrow_data(struct insight_state *s)
 {
-    struct ustream_fd *s_fd = container_of(s, struct ustream_fd, stream);
-    struct insight_data *data = container_of(s_fd, struct insight_data, s);
+    int ret = pthread_rwlock_rdlock(&s->data_lock);
+    assert(ret == 0);
+    return &s->data;
+}
+
+void insight_return_data(struct insight_state *s)
+{
+    int ret = pthread_rwlock_unlock(&s->data_lock);
+    assert(ret == 0);
+}
+
+static void read_cb(struct ustream *stream, int bytes_new)
+{
+    struct ustream_fd *s_fd = container_of(stream, struct ustream_fd, stream);
+    struct insight_state *s = container_of(s_fd, struct insight_state, s_fd);
 
     while (bytes_new-- > 0)
     {
-        int c = rb_getc(data->rb, s);
+        int c = rb_getc(s->rb, stream);
         if (c < 0)
         {
             ULOG_ERR("Failed to read byte: %s\n", strerror(-c));
             break;
         }
-        data->checksum += c;
+        s->checksum += c;
 
-        switch (data->state)
+        switch (s->state)
         {
         case FIND_START:
             if (c == START_BYTE)
             {
-                data->checksum = c;
-                data->state = READ_LENGTH;
+                s->checksum = c;
+                s->state = READ_LENGTH;
             }
             else
             {
                 ULOG_WARN("Discarding non-start byte (0x%02x)\n", c);
-                rb_pop(data->rb);
+                rb_pop(s->rb);
             }
             break;
 
         case READ_LENGTH:
-            data->length = c;
-            if (data->length == MESSAGE_LENGTH)
+            s->length = c;
+            if (s->length == MESSAGE_LENGTH)
             {
-                data->i = 2;
-                data->state = READ_MESSAGE;
+                s->i = 2;
+                s->state = READ_MESSAGE;
             }
             else
             {
-                ULOG_ERR("Unexpected length (%d)\n", data->length);
-                rb_pop(data->rb);
-                rb_reset_iterator(data->rb);
-                data->state = FIND_START;
+                ULOG_ERR("Unexpected length (%d)\n", s->length);
+                rb_pop(s->rb);
+                rb_reset_iterator(s->rb);
+                s->state = FIND_START;
             }
             break;
 
         case READ_MESSAGE:
-            if (++data->i >= data->length - 1)
-                data->state = VERIFY_CHECKSUM;
+            if (++s->i >= s->length - 1)
+                s->state = VERIFY_CHECKSUM;
             break;
 
         case VERIFY_CHECKSUM:
-            if (data->checksum == 0)
-                consume_message(data->rb);
+            if (s->checksum == 0)
+                consume_message(s);
             else
             {
-                ULOG_ERR("Wrong checksum (0x%02x)\n", data->checksum);
-                rb_pop(data->rb);
+                ULOG_ERR("Wrong checksum (0x%02x)\n", s->checksum);
+                rb_pop(s->rb);
             }
-            rb_reset_iterator(data->rb);
-            data->state = FIND_START;
+            rb_reset_iterator(s->rb);
+            s->state = FIND_START;
             break;
         }
     }
@@ -232,26 +243,31 @@ static void state_cb(struct ustream *s)
     }
 }
 
-static void consume_message(struct ring_buffer *rb)
+static void consume_message(struct insight_state *s)
 {
-    struct report r;
-    rb_pop(rb); // start byte
-    rb_pop(rb); // length byte
-    r.int_temperature = get_word(rb, 0.001);
-    r.ext_temperature = get_word(rb, 0.001);
-    r.rms_voltage = get_word(rb, 0.001);
-    r.rms_current = get_word(rb, 0.001 / 128);
-    r.active_power = get_word(rb, 0.005);
-    r.average_power = get_word(rb, 0.005);
-    r.power_factor = get_word(rb, 0.001);
-    r.line_frequency = get_word(rb, 0.001);
-    r.active_energy = get_word(rb, 1); // factor unknown
-    rb_pop(rb);                        // checksum
+    rb_pop(s->rb); // start byte
+    rb_pop(s->rb); // length byte
 
-    print_report(&r);
+    int ret = pthread_rwlock_wrlock(&s->data_lock);
+    assert(ret == 0);
+
+    s->data.int_temperature = get_word(s->rb, 0.001);
+    s->data.ext_temperature = get_word(s->rb, 0.001);
+    s->data.rms_voltage = get_word(s->rb, 0.001);
+    s->data.rms_current = get_word(s->rb, 0.001 / 128);
+    s->data.active_power = get_word(s->rb, 0.005);
+    s->data.average_power = get_word(s->rb, 0.005);
+    s->data.power_factor = get_word(s->rb, 0.001);
+    s->data.line_frequency = get_word(s->rb, 0.001);
+    s->data.active_energy = get_word(s->rb, 1); // factor unknown
+    
+    ret = pthread_rwlock_unlock(&s->data_lock);
+    assert(ret == 0);
+
+    rb_pop(s->rb); // checksum
 }
 
-static void print_report(const struct report *r)
+void print_data(const struct insight_state *s)
 {
     printf(
         "Int. temperature: % 8.3f°C\n"
@@ -264,11 +280,11 @@ static void print_report(const struct report *r)
         "Line frequency:   % 8.3f Hz\n"
         "Active energy:    % 8.3f\n"
         "-----------------------------\n",
-        r->int_temperature, r->ext_temperature,
-        r->rms_voltage, r->rms_current,
-        r->active_power, r->average_power,
-        r->power_factor, r->line_frequency,
-        r->active_energy);
+        s->data.int_temperature, s->data.ext_temperature,
+        s->data.rms_voltage, s->data.rms_current,
+        s->data.active_power, s->data.average_power,
+        s->data.power_factor, s->data.line_frequency,
+        s->data.active_energy);
 }
 
 // Consumes 3 bytes from the ring buffer and assembles them to a little endian
