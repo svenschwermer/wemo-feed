@@ -4,15 +4,15 @@
 struct insight_state;
 struct insight_data
 {
-    float int_temperature;
-    float ext_temperature;
-    float rms_voltage;
-    float rms_current;
-    float active_power;
-    float average_power;
+    float int_temperature; // °C
+    float ext_temperature; // °C
+    float rms_voltage;     // V
+    float rms_current;     // A
+    float active_power;    // W
+    float average_power;   // W
     float power_factor;
-    float line_frequency;
-    float active_energy;
+    float line_frequency;  // Hz
+    float active_energy;   // kWh
 };
 
 struct insight_state *insight_open(const char *dev);

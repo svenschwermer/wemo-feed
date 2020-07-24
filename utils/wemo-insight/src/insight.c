@@ -259,8 +259,8 @@ static void consume_message(struct insight_state *s)
     s->data.average_power = get_word(s->rb, 0.005);
     s->data.power_factor = get_word(s->rb, 0.001);
     s->data.line_frequency = get_word(s->rb, 0.001);
-    s->data.active_energy = get_word(s->rb, 1); // factor unknown
-    
+    s->data.active_energy = get_word(s->rb, 0.001);
+
     ret = pthread_rwlock_unlock(&s->data_lock);
     assert(ret == 0);
 
@@ -278,7 +278,7 @@ void print_data(const struct insight_state *s)
         "Average power:    % 8.3f W\n"
         "Power factor:     % 8.3f\n"
         "Line frequency:   % 8.3f Hz\n"
-        "Active energy:    % 8.3f\n"
+        "Active energy:    % 8.3f kWh\n"
         "-----------------------------\n",
         s->data.int_temperature, s->data.ext_temperature,
         s->data.rms_voltage, s->data.rms_current,
