@@ -1,0 +1,21 @@
+#!/bin/sh
+
+case "$REQUEST_METHOD" in
+GET)
+	if ! data=$(ubus -S call wemo-insight info); then
+		echo 'Status: 500 Internal Server Error'
+		echo
+		exit 1
+	fi
+
+	echo 'Content-Type: application/json'
+	echo
+	echo "$data"
+	;;
+
+*)
+	echo 'Status: 400 Bad Request'
+	echo
+	exit 1
+	;;
+esac
